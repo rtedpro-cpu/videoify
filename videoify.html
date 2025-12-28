@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Videoify — Browser Edition</title>
+<style>
+:root {
+  --bg:#0f1117; --fg:#e6e6eb; --muted:#9aa0a6;
+  --card:#161a22; --accent:#6ae3ff; --danger:#ff6a6a;
+}
+body {
+  background:var(--bg); color:var(--fg);
+  font-family:system-ui, sans-serif;
+  margin:0; padding:30px;
+}
+h1 { margin-top:0 }
+.card {
+  background:var(--card); padding:20px; border-radius:10px;
+  margin-bottom:20px; box-shadow:0 10px 30px #0005;
+}
+label { display:block; margin-top:10px }
+input, button {
+  width:100%; padding:10px; margin-top:5px;
+  background:#0b0e14; color:var(--fg);
+  border:1px solid #333; border-radius:6px;
+}
+button {
+  background:var(--accent); color:#000;
+  font-weight:600; cursor:pointer;
+}
+button:disabled { opacity:.5; cursor:not-allowed }
+small { color:var(--muted) }
+#status { margin-top:10px; white-space:pre-wrap }
+.drop {
+  border:2px dashed #333; padding:20px;
+  border-radius:8px; text-align:center; color:var(--muted);
+}
+.drop.drag { border-color:var(--accent); color:var(--accent) }
+</style>
+</head>
+
+<body>
+
+<h1>Videoify</h1>
+<small>Single‑file, browser‑only MP4 payload embedder</small>
+
+<div class="card">
+<h3>Embed</h3>
+<div class="drop" id="dropEmbed">Drop MP4 here</div>
+<input type="file" id="mp4" accept="video/mp4">
+<input type="file" id="payload">
+<label>Password (optional)</label>
+<input type="password" id="pwEmbed">
+<button onclick="embed()">Embed Payload</button>
+</div>
+
+<div class="card">
+<h3>Extract</h3>
+<div class="drop" id="dropExtract">Drop encoded MP4 here</div>
+<input type="file" id="encoded" accept="video/mp4">
+<label>Password (if used)</label>
+<input type="password" id="pwExtract">
+<button onclick="extract()">Extract Payload</button>
+</div>
+
+<pre id="status"></pre>
+
+<script>
+const status = msg => document.getElementById("status").textContent = msg;
+
+// ==== CONSTANTS ====
+const MARKER = new TextEncoder().encode("VIDEOIFY::V1::");
+const te = new TextEncoder();
+const td = new TextDecoder();
+
+// ==== DRAG & DROP ====
+["dropEmbed","dropExtract"].forEach(id=>{
+  const el=document.getElementById(id);
+  el.ondragover=e=>{e.preventDefault();el.classList.add("drag")}
+  el.ondragleave=_=>el.classList.remove("drag")
+  el.ondrop=e=>{
+    e.preventDefault(); el.classList.remove("drag");
+    const f=e.dataTransfer.files[0];
+    if(id==="dropEmbed") mp4.files=e.dataTransfer.files;
+    else encoded.files=e.dataTransfer.files;
+  }
+});
+
+// ==== CRYPTO ====
+async function deriveKey(password, salt) {
+  const base = await crypto.subtle.importKey(
+    "raw", te.encode(password), "PBKDF2", false, ["deriveKey"]
+  );
+  return crypto.subtle.deriveKey(
+    {name:"PBKDF2", salt, iterations:100000, hash:"SHA-256"},
+    base, {name:"AES-GCM", length:256}, false, ["encrypt","decrypt"]
+  );
+}
+
+async function encrypt(data, password) {
+  if (!password) return {plain:data};
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv   = crypto.getRandomValues(new Uint8Array(12));
+  const key  = await deriveKey(password, salt);
+  const enc  = new Uint8Array(await crypto.subtle.encrypt(
+    {name:"AES-GCM", iv}, key, data
+  ));
+  return {enc, salt, iv};
+}
+
+async function decrypt(data, password, salt, iv) {
+  if (!password) return data;
+  const key = await deriveKey(password, salt);
+  try {
+    return new Uint8Array(await crypto.subtle.decrypt(
+      {name:"AES-GCM", iv}, key, data
+    ));
+  } catch {
+    return null; // Wrong password
+  }
+}
+
+// ==== EMBED ====
+async function embed() {
+  try {
+    status("Embedding...");
+    const v = mp4.files[0], p = payload.files[0];
+    if (!v || !p) throw "Missing files";
+
+    const vb = new Uint8Array(await v.arrayBuffer());
+    const pb = new Uint8Array(await p.arrayBuffer());
+    const pw = pwEmbed.value;
+
+    const meta = JSON.stringify({name:p.name, size:pb.length});
+    const metaBuf = te.encode(meta);
+
+    const enc = await encrypt(pb, pw);
+
+    const header = [
+      MARKER,
+      new Uint8Array([metaBuf.length]),
+      metaBuf,
+      enc.salt || new Uint8Array(),
+      enc.iv   || new Uint8Array(),
+      enc.enc  || enc.plain
+    ];
+
+    const total = header.reduce((s,b)=>s+b.length, vb.length);
+    const out = new Uint8Array(total);
+
+    let o=0;
+    out.set(vb,o); o+=vb.length;
+    header.forEach(b=>{out.set(b,o); o+=b.length});
+
+    download(new Blob([out],{type:"video/mp4"}),"videoify_output.mp4");
+    status("Embed complete ✔");
+  } catch(e){ status("Error: "+e) }
+}
+
+// ==== EXTRACT ====
+async function extract() {
+  try {
+    status("Extracting...");
+    const f = encoded.files[0];
+    if (!f) throw "No file";
+
+    const buf = new Uint8Array(await f.arrayBuffer());
+    let i = buf.indexOf(MARKER[0]);
+    while (i !== -1) {
+      if (MARKER.every((b,j)=>buf[i+j]===b)) break;
+      i = buf.indexOf(MARKER[0], i+1);
+    }
+    if (i === -1) throw "No payload";
+
+    let o = i + MARKER.length;
+    const metaLen = buf[o++];
+
+    const meta = JSON.parse(td.decode(buf.slice(o,o+metaLen)));
+    o += metaLen;
+
+    const salt = buf.slice(o,o+16); o+=16;
+    const iv   = buf.slice(o,o+12); o+=12;
+    const data = buf.slice(o);
+
+    const dec = await decrypt(data, pwExtract.value, salt, iv);
+    if (!dec) throw "Incorrect password!";
+    download(new Blob([dec]), meta.name);
+    status("Extract complete ✔");
+  } catch(e){ status("Error: "+e) }
+}
+
+// ==== UTIL ====
+function download(blob,name){
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(blob);
+  a.download=name; a.click();
+}
+</script>
+</body>
+</html>
